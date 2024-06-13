@@ -41,16 +41,17 @@ class Demultiplexer(nn.Module):
         return x
 
 class MultiplexedModel(nn.Module):
-    def __init__(self, n_streams, model: HookedTransformer):
+    def __init__(self, n_streams, merge_layer, model: HookedTransformer):
         super().__init__()
         self.n_streams = n_streams
         self.model = model
+        self.merge_layer = merge_layer
         # model.requires_grad_(False)
         self.multiplexer = Multiplexer(n_streams, model.cfg.d_model)
         self.demultiplexer = Demultiplexer(n_streams, model.cfg.d_model)
         self.loss_fn = nn.CrossEntropyLoss()
     
-    def forward(self, input_ids, attention_mask=None, labels=None, merge_layer=0, **kwargs):
+    def forward(self, input_ids, attention_mask=None, labels=None, **kwargs):
         assert len(input_ids) == self.n_streams
         # assert len(attention_mask) == self.n_streams
 
@@ -60,12 +61,12 @@ class MultiplexedModel(nn.Module):
             attention_mask = [mask.to(device) for mask in attention_mask]
         else:
             attention_mask = [torch.ones_like(input_id) for input_id in input_ids]
-        resids = [self.model.forward(input_ids[i], attention_mask=attention_mask[i], stop_at_layer=merge_layer, **kwargs) for i in range(self.n_streams)]
+        resids = [self.model.forward(input_ids[i], attention_mask=attention_mask[i], stop_at_layer=self.merge_layer, **kwargs) for i in range(self.n_streams)]
 
         resid_comb = self.multiplexer(resids)
         attention_mask_comb = torch.stack(attention_mask).prod(dim=0)
 
-        last_resid_comb = self.model.forward(resid_comb, attention_mask=attention_mask_comb, start_at_layer=merge_layer, stop_at_layer=self.model.cfg.n_layers, **kwargs)
+        last_resid_comb = self.model.forward(resid_comb, attention_mask=attention_mask_comb, start_at_layer=self.merge_layer, stop_at_layer=self.model.cfg.n_layers, **kwargs)
 
         last_resid = self.demultiplexer(last_resid_comb)
 
@@ -228,6 +229,7 @@ class ScriptArguments:
     block_size: int = None
     random_weights: bool = False
     num_proc: int = 24
+    merge_layer: int = -1
 # %%
 # Check if a GPU is available and set the device
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -252,7 +254,7 @@ if args.block_size is None:
 
 
 # %%
-model = MultiplexedModel(args.n_streams, transformer_model).to(torch.bfloat16).to(train_args.device)
+model = MultiplexedModel(args.n_streams, args.merge_layer, transformer_model).to(torch.bfloat16).to(train_args.device)
 
 # model = transformer_model
 # print number of trainable parameters

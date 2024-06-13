@@ -21,6 +21,7 @@ set -e
 # WANDB_MODE=offline
 CUDA_VISIBLE_DEVICES=1 WANDB_PROJECT=superposition-decoding python ft_multiplex_llama.py \
     --n_streams=1 \
+    --merge_layer=12 \
     --random_weights=False \
     --model_id='gpt2' \
     --output_dir='output' \
