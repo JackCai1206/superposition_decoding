@@ -1,18 +1,26 @@
 from transformers.integrations import WandbCallback
 import pandas as pd
-from transformers import EvalPrediction
+from transformers import EvalPrediction, Trainer
 
-def decode_predictions(tokenizer, pred: EvalPrediction, n_streams=1):
-    ground_truth = []
+# def decode_predictions(tokenizer, pred: EvalPrediction, n_streams=1):
+#     ground_truth = []
+#     prediction = []
+#     for s in range(n_streams):
+#         labels = tokenizer.batch_decode(pred.label_ids[s], skip_special_tokens=True)
+#         prediction_text = tokenizer.batch_decode(pred.predictions[0][s].argmax(axis=-1), skip_special_tokens=True)
+#         ground_truth.append(labels)
+#         prediction.append(prediction_text)
+#     return [{"ground_truth": ground_truth[i], "prediction": prediction[i]} for i in range(n_streams)]
+
+def decode_predictions(tokenizer, prompt_ids, pred_ids, n_streams=1):
+    prompt = []
     prediction = []
     for s in range(n_streams):
-        labels = tokenizer.batch_decode(pred.label_ids[s])
-        # logits = pred.predictions[0].argmax(axis=-1)
-        prediction_text = tokenizer.batch_decode(pred.predictions[1][s])
-        ground_truth.append(labels)
-        prediction.append(prediction_text)
-    return [{"ground_truth": ground_truth[i], "prediction": prediction[i]} for i in range(n_streams)]
-
+        pred_text = tokenizer.batch_decode(pred_ids[s], skip_special_tokens=True)
+        prediction.append(pred_text)
+        prompt_text = tokenizer.batch_decode(prompt_ids[s], skip_special_tokens=True)
+        prompt.append(prompt_text)
+    return [{"Prompt": prompt[i], "Generation": prediction[i]} for i in range(n_streams)]
 
 class WandbPredictionProgressCallback(WandbCallback):
     """Custom WandbCallback to log model predictions during training.
@@ -31,7 +39,7 @@ class WandbPredictionProgressCallback(WandbCallback):
         freq (int, optional): Frequency of logging. Defaults to 2.
     """
 
-    def __init__(self, trainer, tokenizer, val_dataset,
+    def __init__(self, trainer: Trainer, tokenizer, val_dataset,
                  num_samples=100, freq=2, args=None):
         """Initializes the WandbPredictionProgressCallback instance.
 
@@ -57,17 +65,30 @@ class WandbPredictionProgressCallback(WandbCallback):
         # control the frequency of logging by logging the predictions
         # every `freq` epochs
         if int(state.epoch) % self.freq == 0:
-            # generate predictions
-            predictions = self.trainer.predict(self.sample_dataset)
-            # decode predictions and labels
-            predictions = decode_predictions(self.tokenizer, predictions, self.args.n_streams)
-            # add predictions to a wandb.Table
+            inputs = self.sample_dataset[0:1]
+            prompt_ids = inputs["input_ids"].permute(1,0,2)[..., :20].unbind(0)
+            pred_ids = self.trainer.model.generate(prompt_ids, max_new_tokens=100)
+            data = decode_predictions(self.tokenizer, prompt_ids, pred_ids, self.args.n_streams)
             results = {}
-            for i, stream_pred in enumerate(predictions):
+            for i, stream_pred in enumerate(data):
               predictions_df = pd.DataFrame(stream_pred)
               predictions_df["epoch"] = state.epoch
               records_table = self._wandb.Table(dataframe=predictions_df)
               results[f"pred_stream_{i}"] = records_table
-            # log the table to wandb
             self._wandb.log(results)
+            
+            # ----------------- (Legacy) -----------------
+            # # generate predictions
+            # predictions = self.trainer.predict(self.sample_dataset)
+            # # decode predictions and labels
+            # predictions = decode_predictions(self.tokenizer, predictions, self.args.n_streams)
+            # # add predictions to a wandb.Table
+            # results = {}
+            # for i, stream_pred in enumerate(predictions):
+            #   predictions_df = pd.DataFrame(stream_pred)
+            #   predictions_df["epoch"] = state.epoch
+            #   records_table = self._wandb.Table(dataframe=predictions_df)
+            #   results[f"pred_stream_{i}"] = records_table
+            # # log the table to wandb
+            # self._wandb.log(results)
 
