@@ -58,7 +58,11 @@ class WandbPredictionProgressCallback(WandbCallback):
         self.tokenizer = tokenizer
         self.sample_dataset = val_dataset.select(range(num_samples))
         self.freq = freq
-        self.args = args
+        self.my_args = args
+      
+    def setup(self, args, state, model, **kwargs):
+        super().setup(args, state, model, **kwargs)
+        self._wandb.config.update(self.my_args, allow_val_change=True)
 
     def on_evaluate(self, args, state, control, **kwargs):
         super().on_evaluate(args, state, control, **kwargs)
@@ -66,9 +70,9 @@ class WandbPredictionProgressCallback(WandbCallback):
         # every `freq` epochs
         if int(state.epoch) % self.freq == 0:
             inputs = self.sample_dataset[0:1]
-            prompt_ids = inputs["input_ids"].permute(1,0,2)[..., :20].unbind(0)
-            pred_ids = self.trainer.model.generate(prompt_ids, max_new_tokens=100)
-            data = decode_predictions(self.tokenizer, prompt_ids, pred_ids, self.args.n_streams)
+            prompt_ids = inputs["input_ids"].permute(1,0,2)[..., :40].unbind(0)
+            pred_ids = self.trainer.model.generate(prompt_ids, max_new_tokens=100, use_past_kv_cache=False)
+            data = decode_predictions(self.tokenizer, prompt_ids, pred_ids, self.my_args.n_streams)
             results = {}
             for i, stream_pred in enumerate(data):
               predictions_df = pd.DataFrame(stream_pred)
@@ -81,7 +85,7 @@ class WandbPredictionProgressCallback(WandbCallback):
             # # generate predictions
             # predictions = self.trainer.predict(self.sample_dataset)
             # # decode predictions and labels
-            # predictions = decode_predictions(self.tokenizer, predictions, self.args.n_streams)
+            # predictions = decode_predictions(self.tokenizer, predictions, self.my_args.n_streams)
             # # add predictions to a wandb.Table
             # results = {}
             # for i, stream_pred in enumerate(predictions):

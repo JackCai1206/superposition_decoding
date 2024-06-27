@@ -3,8 +3,10 @@ import torch
 from torch import nn
 import tqdm
 from transformers import AutoTokenizer, Trainer, EvalPrediction, set_seed, HfArgumentParser, TrainingArguments, LlamaForCausalLM, AutoModelForCausalLM, default_data_collator, PreTrainedModel, GenerationMixin
+from transformers import BertConfig
+from transformers.models.bert.modeling_bert import BertEncoder
 from datasets import load_dataset, Dataset
-from transformer_lens import HookedTransformer
+from transformer_lens import HookedTransformer, HookedTransformerConfig
 import os
 from dataclasses import dataclass
 # %%
@@ -16,55 +18,100 @@ from transformer_lens.utilities import devices
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
 import transformer_lens.utils as utils
 
+@dataclass
+class ScriptArguments:
+    model_id: str = "meta-llama/Meta-Llama-3-8B"
+    n_streams: int = 1
+    block_size: int = None
+    from_pretrained: bool = False
+    freeze_transformer: bool = False
+    random_weights: bool = False
+    num_proc: int = 24
+    merge_layer: int = -1
+
 class Multiplexer(nn.Module):
     def __init__(self, n_streams, d_model):
         super().__init__()
         self.n_streams = n_streams
-        self.phis = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_streams)])
+        # self.phis = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_streams)])
+        # for i, phi in enumerate(self.phis):
+        #     # nn.init.orthogonal_(phi.weight)
+        #     phi.weight.data = torch.diag(self.rand_gaussians[i]) # not trainable
+        # rand_gaussians = torch.stack([torch.randn(d_model) for _ in range(n_streams)])
+        # self.register_buffer('rand_gaussians', rand_gaussians)
+        self.rand_gaussians = nn.ParameterList([nn.Parameter(torch.randn(d_model)) for _ in range(n_streams)])
+        self.transformer = BertEncoder(BertConfig(hidden_size=d_model, num_hidden_layers=2, num_attention_heads=4))
 
     def forward(self, x: List[Tensor]):
-        assert len(x) == self.n_streams
+        # assert len(x) == self.n_streams
         # x = [xx.to(self.phis[0].weight.data.dtype) for xx in x]
-        x = [phi(xi) for xi, phi in zip(x, self.phis)]
-        x = torch.stack(x).mean(dim=0)
+        # x = [phi(xi) for xi, phi in zip(x, self.phis)]
+        x = [xi * phi for xi, phi in zip(x, self.rand_gaussians)]
+        x = torch.stack(x)
+        N, B, L, D = x.shape
+        x = x.swapaxes(0, 2).reshape(L * B, N, D) # combine seq_len and batch
+        x = self.transformer(x, output_hidden_states=True).last_hidden_state
+        x = x.reshape(L, B, N, D).swapaxes(0, 2).mean(dim=0)
         return x
+        # return x[0]
 
 class Demultiplexer(nn.Module):
     def __init__(self, n_streams, d_model):
         super().__init__()
         self.n_streams = n_streams
-        self.phis = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_streams)])
+        # self.phis = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_streams)])
+        # for phi in self.phis:
+            # nn.init.orthogonal_(phi.weight)
+        dim_key = d_model // 4
+        self.keys = nn.ParameterList([nn.Parameter(torch.randn(dim_key)) for _ in range(n_streams)])
+        self.MLP = nn.Sequential(
+            nn.Linear(d_model+dim_key, d_model+dim_key),
+            nn.GELU(),
+            nn.Linear(d_model+dim_key, d_model),
+            nn.LayerNorm(d_model)
+        )
+        # self.MLP = nn.Identity(d_model, d_model)
 
     def forward(self, x):
         # x = x.to(self.phis[0].weight.data.dtype)
-        x = [phi(x) for phi in self.phis]
+        # x = [phi(x) for phi in self.phis]
+        x = [torch.cat([x.clone(), key.expand(x.shape[0], x.shape[1], -1)], dim=-1) for key in self.keys]
+        # x = [x for key in self.keys]
+        x = [self.MLP(xi) for xi in x]
         return x
+        # return [x]
 
 class MultiplexedModel(nn.Module):
-    def __init__(self, n_streams, merge_layer, model: HookedTransformer):
+    def __init__(self, model: HookedTransformer, args: ScriptArguments):
         super().__init__()
-        self.n_streams = n_streams
+        self.n_streams = args.n_streams
         self.model = model
-        self.merge_layer = merge_layer
-        # model.requires_grad_(False)
-        self.multiplexer = Multiplexer(n_streams, model.cfg.d_model)
-        self.demultiplexer = Demultiplexer(n_streams, model.cfg.d_model)
+        self.merge_layer = args.merge_layer
+        if args.freeze_transformer:
+            model.requires_grad_(False)
+        self.multiplexer = Multiplexer(args.n_streams, model.cfg.d_model)
+        self.demultiplexer = Demultiplexer(args.n_streams, model.cfg.d_model)
         self.loss_fn = nn.CrossEntropyLoss()
     
-    def forward(self, input_ids, attention_mask=None, labels=None, **kwargs):
+    def forward(self, input_ids, attention_mask=None, labels=None, past_kv_caches=None, **kwargs):
         assert len(input_ids) == self.n_streams
+        if past_kv_caches is not None:
+            raise NotImplementedError("Past key-value caches are not yet supported.")
         # assert len(attention_mask) == self.n_streams
 
-        device = devices.get_device_for_block_index(0, self.model.cfg)
-        input_ids = [input_id.to(device) for input_id in input_ids]
+        # device = devices.get_device_for_block_index(0, self.model.cfg)
+        input_ids = [input_id for input_id in input_ids]
         if attention_mask is not None:
-            attention_mask = [mask.to(device) for mask in attention_mask]
+            attention_mask = [mask for mask in attention_mask]
         else:
-            attention_mask = [torch.ones_like(input_id) for input_id in input_ids]
+            attention_mask = [None for _ in input_ids]
         resids = [self.model.forward(input_ids[i], attention_mask=attention_mask[i], stop_at_layer=self.merge_layer, **kwargs) for i in range(self.n_streams)]
 
         resid_comb = self.multiplexer(resids)
-        attention_mask_comb = torch.stack(attention_mask).prod(dim=0)
+        if attention_mask[0] is not None:
+            attention_mask_comb = torch.stack(attention_mask).prod(dim=0)
+        else:
+            attention_mask_comb = None
 
         last_resid_comb = self.model.forward(resid_comb, attention_mask=attention_mask_comb, start_at_layer=self.merge_layer, stop_at_layer=self.model.cfg.n_layers, **kwargs)
 
@@ -74,10 +121,18 @@ class MultiplexedModel(nn.Module):
             logits_and_losses = [self.model.forward(last_resid[i], tokens=labels[i], start_at_layer=self.model.cfg.n_layers, return_type='both') for i in range(self.n_streams)]
             logits = [logits_and_losses[i][0] for i in range(self.n_streams)]
             losses = [logits_and_losses[i][1] for i in range(self.n_streams)]
-            loss = sum(losses)
+            loss = sum(losses) / self.n_streams
         else:
             logits = [self.model.forward(last_resid[i], start_at_layer=self.model.cfg.n_layers, return_type='logits') for i in range(self.n_streams)]
             loss = None
+        # if labels is not None:
+        #     logits_and_losses = [self.model.forward(input_ids[i], tokens=labels[i], return_type='both', **kwargs) for i in range(self.n_streams)]
+        #     logits = [logits_and_losses[i][0] for i in range(self.n_streams)]
+        #     losses = [logits_and_losses[i][1] for i in range(self.n_streams)]
+        #     loss = sum(losses)
+        # else:
+        #     logits = [self.model.forward(input_ids[i], return_type='logits') for i in range(self.n_streams)]
+        #     loss = None
 
         return (
             loss, 
@@ -113,9 +168,9 @@ class MultiplexedModel(nn.Module):
         device = devices.get_device_for_block_index(0, self.model.cfg)
         tokens = [t.to(device) for t in tokens]
         if use_past_kv_cache:
-            past_kv_cache = HookedTransformerKeyValueCache.init_cache(
+            past_kv_caches = [HookedTransformerKeyValueCache.init_cache(
                 self.model.cfg, self.model.cfg.device, batch_size
-            )
+            ) for _ in range(self.n_streams)]
         else:
             past_kv_cache = None
 
@@ -161,7 +216,7 @@ class MultiplexedModel(nn.Module):
                         return_type="logits",
                         prepend_bos=prepend_bos,
                         padding_side=padding_side,
-                        past_kv_cache=past_kv_cache,
+                        past_kv_caches=past_kv_caches,
                     )[1]
                 else:
                     logits = self.forward(
@@ -169,7 +224,7 @@ class MultiplexedModel(nn.Module):
                         return_type="logits",
                         prepend_bos=prepend_bos,
                         padding_side=padding_side,
-                        past_kv_cache=past_kv_cache,
+                        past_kv_caches=past_kv_caches,
                     )[1]
             else:
                 # We input the entire sequence, as a [batch, pos] tensor, since we aren't using
@@ -221,15 +276,6 @@ class MultiplexedModel(nn.Module):
 
         return tokens
 
-    
-@dataclass
-class ScriptArguments:
-    model_id: str = "meta-llama/Meta-Llama-3-8B"
-    n_streams: int = 1
-    block_size: int = None
-    random_weights: bool = False
-    num_proc: int = 24
-    merge_layer: int = -1
 # %%
 # Check if a GPU is available and set the device
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -241,12 +287,33 @@ set_seed(42)
 
 args, train_args= HfArgumentParser((ScriptArguments, TrainingArguments)).parse_args_into_dataclasses()
 
+datasets = (load_dataset('roneneldan/TinyStories', split='train') for _ in range(args.n_streams))
+eval_datasets = (load_dataset('roneneldan/TinyStories', split='validation[:384]') for _ in range(args.n_streams))
+
 # Load the tokenizer from the Hugging Face library
 tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = 'left'
+tokenizer.add_bos_token = True
+tokenizer.add_eos_token = True
 
-transformer_model = HookedTransformer.from_pretrained_no_processing(args.model_id, torch_dtype=torch.bfloat16, device=train_args.device)
-if args.random_weights:
-    transformer_model.init_weights()
+if args.from_pretrained:
+    transformer_model = HookedTransformer.from_pretrained_no_processing(args.model_id, torch_dtype=torch.bfloat16, device=train_args.device)
+    if args.random_weights:
+        transformer_model.init_weights()
+else:
+    model_cfg = HookedTransformerConfig(
+        d_model=384,
+        d_head=64,
+        n_layers=6,
+        n_ctx=512,
+        act_fn='silu',
+        positional_embedding_type='rotary',
+        normalization_type='RMS',
+        device=None,
+        dtype=torch.bfloat16,
+    )
+    transformer_model = HookedTransformer(model_cfg, tokenizer, move_to_device=False)
 
 # transformer_model: LlamaForCausalLM = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=torch.bfloat16, return_dict=False, attn_implementation="eager")
 if args.block_size is None:
@@ -254,19 +321,12 @@ if args.block_size is None:
 
 
 # %%
-model = MultiplexedModel(args.n_streams, args.merge_layer, transformer_model).to(torch.bfloat16).to(train_args.device)
+model = MultiplexedModel(transformer_model, args)
 
 # model = transformer_model
 # print number of trainable parameters
+print(f"Number of trainable parameters in transformer: {sum(p.numel() for p in transformer_model.parameters() if p.requires_grad)}")
 print(f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-
-# %%
-
-datasets = (load_dataset('roneneldan/TinyStories', split='train') for _ in range(args.n_streams))
-eval_datasets = (load_dataset('roneneldan/TinyStories', split='validation[:200]') for _ in range(args.n_streams))
-
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = 'left'
 
 def tokenization(batch):
     batch = tokenizer(batch['text'])
@@ -304,7 +364,13 @@ def zip_datasets(datasets: Tuple[Dataset]):
         .map(group_texts, batched=True, num_proc=args.num_proc)
         .shuffle(seed=42 + i)
     for i, dataset in enumerate(list(datasets))])
-    dataset = Dataset.from_generator(get_zipped_dataset_generator, gen_kwargs={'datasets': datasets, 'shards': list(range(args.num_proc))}, num_proc=args.num_proc, cache_dir=f'huggingface_cache/n_streams-{args.n_streams}/')
+    dataset = Dataset.from_generator(
+        get_zipped_dataset_generator,
+        gen_kwargs={'datasets': datasets, 'shards': list(range(args.num_proc))},
+        num_proc=args.num_proc,
+        cache_dir=f'huggingface_cache/n_streams-{args.n_streams}/',
+        hash=''.join([d._fingerprint for d in datasets]),
+    )
     dataset.set_format(type='torch', output_all_columns=True)
     # dataset = dataset.map(concat_shards, batched=False, num_proc=16)
     return dataset
