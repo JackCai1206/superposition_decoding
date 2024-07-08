@@ -20,22 +20,30 @@ set -e
 
 # WANDB_MODE=disabled
 # CUDA_VISIBLE_DEVICES=0,1 
-for from_pretrained freeze_transformer random_weights in \
-    True False True \
-    True True False \
-    True False False \
+
+    # True True False False \
+    # True False False False \
+    # True False True False \
+
+for from_pretrained freeze_transformer random_weights use_lora in \
+    True False False True
 ; do
     for n_streams in 2; do
-        for merge_layer in 0; do
-            CUDA_VISIBLE_DEVICES=0 WANDB_PROJECT=superposition-decoding python ft_multiplex_llama.py \
+        for merge_layer in 10; do
+            CUDA_VISIBLE_DEVICES=0 WANDB_PROJECT=superposition-decoding WANDB_MODE=disabled python -m pdb ft_multiplex_llama.py \
                 --n_streams=$n_streams \
                 --merge_layer=$merge_layer \
-                --from_pretrained=$from_pretrained \
+                --model_attribute='transformer' \
+                --layers_attribute='h' \
                 --freeze_transformer=$freeze_transformer \
+                \
+                --model_id='gpt2' \
+                --from_pretrained=$from_pretrained \
                 --random_weights=$random_weights \
-                --model_id='roneneldan/TinyStories-33M' \
+                --use_lora=True \
+                \
                 --output_dir='output' \
-                --run_name='n_streams='$n_streams'-merge_layer='$merge_layer'-cross_instance_TF-from_pretrained='$from_pretrained'-freeze_transformer='$freeze_transformer'-random_weights='$random_weights \
+                --run_name='n_streams='$n_streams'-merge_layer='$merge_layer'-from_pretrained='$from_pretrained'-freeze_transformer='$freeze_transformer'-random_weights='$random_weights \
                 --overwrite_output_dir=True \
                 --num_train_epochs=2 \
                 --max_steps=5000 \
@@ -43,7 +51,7 @@ for from_pretrained freeze_transformer random_weights in \
                 --logging_steps=10 \
                 --bf16=True \
                 --tf32=True \
-                --adam_beta2=0.95 \
+                --adam_beta2=0.99 \
                 --use_cpu=False \
                 --gradient_accumulation_steps=32 \
                 --eval_strategy="steps" \
@@ -51,9 +59,10 @@ for from_pretrained freeze_transformer random_weights in \
                 --batch_eval_metrics=True\
                 --learning_rate=5e-4 \
                 --lr_scheduler_type='cosine' \
-                --warmup_steps=1000 \
-                --torch_compile=True \
-                --auto_find_batch_size=True
+                --warmup_steps=200 \
+                --torch_compile=False \
+                --per_device_train_batch_size=8 \
+                --per_device_eval_batch_size=8
         done
     done
 done
