@@ -1,7 +1,8 @@
 import torch
-from torch import Tensor, nn
+from torch import LongTensor, Tensor, nn
 from jaxtyping import Float, Int
 from transformers import BertConfig, PreTrainedModel, Cache, PretrainedConfig
+from transformers.generation.configuration_utils import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.bert.modeling_bert import BertEncoder
 from typing import List, Literal, Optional, Sequence, Tuple, Union, cast
@@ -60,10 +61,14 @@ class MultiplexedModel(PreTrainedModel):
         super().__init__(args)
         self.config = args
         self.n_streams = args.n_streams
+
+        # Is this good practice? I am just stealing the attributes from the underlying transformer model mainly because i want to test different models
+        self.tf_lm_model = tf_lm_model
         self.tf_model = getattr(tf_lm_model, args.model_attribute)
         self.pre_merge_layers = getattr(self.tf_model, args.layers_attribute)[:args.merge_layer]
         self.post_merge_layers = getattr(self.tf_model, args.layers_attribute)[args.merge_layer:]
         self.lm_head = getattr(tf_lm_model, "lm_head")
+
         self.merge_layer = args.merge_layer
         self.multiplexer = Multiplexer(args.n_streams, args.hidden_size)
         self.demultiplexer = Demultiplexer(args.n_streams, args.hidden_size)
@@ -82,19 +87,30 @@ class MultiplexedModel(PreTrainedModel):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-        cache_position: torch.LongTensor | None = None
+        cache_position: torch.LongTensor | None = None,
+        squeeze_stream_dim: bool = False,
+        **kwargs
     ) -> Tuple | CausalLMOutputWithPast:
         if past_key_values is not None:
             raise NotImplementedError("Past key-value caches are not yet supported.")
         
-        # combine n_streams and batch dimensions
-        # input_ids = input_ids.view(-1, *input_ids.shape[2:])
+        if squeeze_stream_dim:
+            assert len(input_ids.shape) == 2, f"Input ids should be (n_streams * batch_size, seq_len) but got shape {input_ids.shape}"
+            input_ids = input_ids.view(self.n_streams, -1, input_ids.shape[-1])
+            assert attention_mask is None or len(attention_mask.shape) == 2, f"Attention mask should be (n_streams * batch_size, seq_len) but got shape {attention_mask.shape}"
+            if attention_mask is not None:
+                attention_mask = attention_mask.view(self.n_streams, -1, attention_mask.shape[-1])
+        else:
+            assert len(input_ids.shape) == 3, f"Input ids should be (n_streams, batch_size, seq_len) but got shape {input_ids.shape}"
+            assert attention_mask is None or len(attention_mask.shape) == 3, f"Attention mask should be (n_streams, batch_size, seq_len) but got shape {attention_mask.shape}"
         
         # Individually process until merge layer
         setattr(self.tf_model, self.config.layers_attribute, self.pre_merge_layers)
-        resids = [self.tf_model.forward(input_ids[i], attention_mask=attention_mask[i])[0] for i in range(self.n_streams)]
+        resids = [self.tf_model.forward(input_ids[i], attention_mask=attention_mask[i], **kwargs)[0] for i in range(self.n_streams)]
 
         resid_comb = self.multiplexer(resids)
+        del resids
+        
         if attention_mask is not None:
             attention_mask_comb = attention_mask.prod(dim=0) # different streams may have different left padding lengths, but since we are combining the streams, we have to multiply the attention masks - Is there a better way to do this?
         else:
@@ -102,26 +118,27 @@ class MultiplexedModel(PreTrainedModel):
 
         # Process together after merge layer
         setattr(self.tf_model, self.config.layers_attribute, self.post_merge_layers)
-        last_resid_comb = self.tf_model.forward(inputs_embeds=resid_comb, attention_mask=attention_mask_comb)
+        last_resid_comb = self.tf_model.forward(inputs_embeds=resid_comb, attention_mask=attention_mask_comb, **kwargs)[0]
+        del resid_comb
 
         last_resid = self.demultiplexer(last_resid_comb)
+        del last_resid_comb
 
-        logits = self.lm_head(last_resid[i])
+        logits = torch.stack([self.lm_head(last_resid[i]) for i in range(self.n_streams)]) # do this one by one in case OOM
+        if squeeze_stream_dim:
+            logits = logits.view(-1, *logits.shape[-2:])
+
         loss = None
         if labels is not None:
-            losses = []
-            for i in range(self.n_streams):
-                # Shift so that tokens < n predict n
-                shift_logits = logits[i][..., :-1, :].contiguous()
-                shift_labels = labels[i][..., 1:].contiguous()
-                # Flatten the tokens
-                shift_logits = shift_logits.view(-1, self.tf_model.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = self.loss_fn(shift_logits, shift_labels)
-                losses.append(loss)
-            loss = sum(losses) / self.n_streams
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            shift_logits = shift_logits.view(-1, self.tf_model.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = self.loss_fn(shift_logits, shift_labels)
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -130,7 +147,18 @@ class MultiplexedModel(PreTrainedModel):
             hidden_states=None,
             attentions=None,
         )
-    
-    # def generate(self, inputs: Tensor | None = None, generation_config: GenerationConfig | None = None, logits_processor: LogitsProcessorList | None = None, stopping_criteria: StoppingCriteriaList | None = None, prefix_allowed_tokens_fn: Callable[[int, Tensor], List[int]] | None = None, synced_gpus: bool | None = None, assistant_model: PreTrainedModel | None = None, streamer: BaseStreamer | None = None, negative_prompt_ids: Tensor | None = None, negative_prompt_attention_mask: Tensor | None = None, **kwargs) -> GenerateDecoderOnlyOutput | GenerateEncoderDecoderOutput | GenerateBeamDecoderOnlyOutput | GenerateBeamEncoderDecoderOutput | torch.LongTensor:
-    #     output =  super().generate(inputs, generation_config, logits_processor, stopping_criteria, prefix_allowed_tokens_fn, synced_gpus, assistant_model, streamer, negative_prompt_ids, negative_prompt_attention_mask, **kwargs)
+        
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        assert kwargs.get('past_key_values', None) is None, "Past key values are not yet supported."
+        model_inputs = self.tf_lm_model.prepare_inputs_for_generation(*args, **kwargs)
+        model_inputs.update({'squeeze_stream_dim': True}) # needed because generate() expects input_ids to be (batch_size, seq_len)
+        return model_inputs
 
+    def squeeze_n_streams_and_generate(self, inputs: Tensor, *args, **kwargs):
+        inputs = inputs.view(-1, inputs.shape[-1]) # needed because generate() expects input_ids to be (batch_size, seq_len)
+        result = self.generate(inputs, *args, **kwargs)
+        if isinstance(result, Tensor):
+            result = result.view(self.n_streams, -1, *result.shape[1:])
+        else:
+            raise NotImplementedError("Only LongTensor is supported for now.")
+        return result

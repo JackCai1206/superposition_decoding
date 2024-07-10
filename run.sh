@@ -29,8 +29,8 @@ for from_pretrained freeze_transformer random_weights use_lora in \
     True False False True
 ; do
     for n_streams in 2; do
-        for merge_layer in 10; do
-            CUDA_VISIBLE_DEVICES=0 WANDB_PROJECT=superposition-decoding WANDB_MODE=disabled python -m pdb ft_multiplex_llama.py \
+        for merge_layer in 0; do
+            CUDA_VISIBLE_DEVICES=0 WANDB_PROJECT=superposition-decoding python ft_multiplex_llama.py \
                 --n_streams=$n_streams \
                 --merge_layer=$merge_layer \
                 --model_attribute='transformer' \
@@ -53,16 +53,16 @@ for from_pretrained freeze_transformer random_weights use_lora in \
                 --tf32=True \
                 --adam_beta2=0.99 \
                 --use_cpu=False \
-                --gradient_accumulation_steps=32 \
                 --eval_strategy="steps" \
-                --eval_steps=250 \
+                --eval_steps=1 \
                 --batch_eval_metrics=True\
                 --learning_rate=5e-4 \
                 --lr_scheduler_type='cosine' \
                 --warmup_steps=200 \
                 --torch_compile=False \
                 --per_device_train_batch_size=8 \
-                --per_device_eval_batch_size=8
+                --per_device_eval_batch_size=8 \
+                --gradient_accumulation_steps=64
         done
     done
 done

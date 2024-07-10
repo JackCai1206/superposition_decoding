@@ -9,6 +9,11 @@ def tokenization(batch, tokenizer: PreTrainedTokenizer):
     batch = tokenizer(batch['text'])
     return batch
 
+def tokenization_eval(batch, tokenizer: PreTrainedTokenizer):
+    batch = tokenizer(batch['text'], padding='max_length', truncation=True)
+    batch['labels'] = batch['input_ids'].copy()
+    return batch
+
 def group_texts(examples, block_size):
     # Concatenate all texts.
     concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
@@ -43,14 +48,19 @@ def zip_datasets(datasets: Tuple[Dataset]):
 def get_datasets(args: ScriptArguments, tokenizer: PreTrainedTokenizer):
     datasets = (load_dataset('roneneldan/TinyStories', split='train') for _ in range(args.n_streams))
     eval_datasets = (load_dataset('roneneldan/TinyStories', split='validation[:384]') for _ in range(args.n_streams))
+
+    tokenizer.padding_side = 'left'
     datasets = tuple([
             dataset.map(tokenization, batched=True, num_proc=args.num_proc, remove_columns=list(dataset.features), fn_kwargs={'tokenizer': tokenizer})
             .map(group_texts, batched=True, num_proc=args.num_proc, fn_kwargs={'block_size': args.block_size})
             .shuffle(seed=42 + i) # is this really slow? can also convert to iterable and then shuffle
         for i, dataset in enumerate(list(datasets))
     ])
+
+    tokenizer.padding_side = 'right'
     eval_datasets = tuple([
-            dataset.map(tokenization, batched=True, num_proc=args.num_proc, remove_columns=list(dataset.features), fn_kwargs={'tokenizer': tokenizer})
+            dataset.map(tokenization_eval, batched=True, num_proc=args.num_proc, remove_columns=list(dataset.features), fn_kwargs={'tokenizer': tokenizer})
+            .shuffle(seed=42)
         for i, dataset in enumerate(list(eval_datasets))
     ])
     dataset = zip_datasets(datasets)

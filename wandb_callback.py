@@ -1,3 +1,4 @@
+from itertools import islice
 from transformers.integrations import WandbCallback
 import pandas as pd
 from transformers import EvalPrediction, Trainer
@@ -56,7 +57,7 @@ class WandbPredictionProgressCallback(WandbCallback):
         super().__init__()
         self.trainer = trainer
         self.tokenizer = tokenizer
-        self.sample_dataset = val_dataset.select(range(num_samples))
+        self.sample_dataset = islice(val_dataset, num_samples)
         self.freq = freq
         self.my_args = args
       
@@ -69,9 +70,9 @@ class WandbPredictionProgressCallback(WandbCallback):
         # control the frequency of logging by logging the predictions
         # every `freq` epochs
         if int(state.epoch) % self.freq == 0:
-            inputs = self.sample_dataset[0:1]
-            prompt_ids = inputs["input_ids"].permute(1,0,2)[..., :40].unbind(0)
-            pred_ids = self.trainer.model.generate(prompt_ids, max_new_tokens=100, use_past_kv_cache=False)
+            _, inputs = next(enumerate(self.trainer.get_eval_dataloader()))
+            prompt_ids = inputs["input_ids"][..., :20].to(self.trainer.args.device)
+            pred_ids = self.trainer.model.squeeze_n_streams_and_generate(prompt_ids, max_new_tokens=100, use_cache=False) # kv cache is not supported yet
             data = decode_predictions(self.tokenizer, prompt_ids, pred_ids, self.my_args.n_streams)
             results = {}
             for i, stream_pred in enumerate(data):
